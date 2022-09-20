@@ -6,7 +6,7 @@
 
 #include <custom_shader_ps.h>
 #include <custom_shader_vs.h>
-#include <shader_ps.h>
+#include <shader_text_ps.h>
 #include <shader_vs.h>
 
 #include "../../interactivity/win32/CustomWindowMessages.h"
@@ -38,10 +38,7 @@ AtlasEngine::AtlasEngine()
 #endif
 
     THROW_IF_FAILED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(_sr.dwriteFactory), reinterpret_cast<::IUnknown**>(_sr.dwriteFactory.addressof())));
-    if (const auto factory2 = _sr.dwriteFactory.try_query<IDWriteFactory2>())
-    {
-        THROW_IF_FAILED(factory2->GetSystemFontFallback(_sr.systemFontFallback.addressof()));
-    }
+    THROW_IF_FAILED(_sr.dwriteFactory->GetSystemFontFallback(_sr.systemFontFallback.addressof()));
     {
         wil::com_ptr<IDWriteTextAnalyzer> textAnalyzer;
         THROW_IF_FAILED(_sr.dwriteFactory->CreateTextAnalyzer(textAnalyzer.addressof()));
@@ -157,7 +154,6 @@ try
 
             THROW_IF_FAILED(_r.device->CreateVertexShader(vs->GetBufferPointer(), vs->GetBufferSize(), nullptr, _r.vertexShader.put()));
             THROW_IF_FAILED(_r.device->CreatePixelShader(ps->GetBufferPointer(), ps->GetBufferSize(), nullptr, _r.pixelShader.put()));
-            _setShaderResources();
         }
         CATCH_LOG()
     }
@@ -165,8 +161,6 @@ try
 
     if constexpr (debugGlyphGenerationPerformance)
     {
-        _r.glyphs = {};
-        _r.tileAllocator = TileAllocator{ _api.fontMetrics.cellSize, _api.sizeInPixel };
     }
     if constexpr (debugTextParsingPerformance)
     {
@@ -210,13 +204,8 @@ try
             // |xxxxxxx   |    |          |  |      v
             // +----------+    +----------+  v             < end
             {
-                const auto beg = _r.cells.begin();
-                const auto end = _r.cells.end();
-                std::move(beg - offset, end, beg);
-            }
-            {
-                const auto beg = _r.cellGlyphMapping.begin();
-                const auto end = _r.cellGlyphMapping.end();
+                const auto beg = _r.rows.begin();
+                const auto end = _r.rows.end();
                 std::move(beg - offset, end, beg);
             }
         }
@@ -233,13 +222,8 @@ try
             // |          |    |xxxxxxx   |  v      |      < end - offset
             // +----------+    +----------+         + dst  < end
             {
-                const auto beg = _r.cells.begin();
-                const auto end = _r.cells.end();
-                std::move_backward(beg, end - offset, end);
-            }
-            {
-                const auto beg = _r.cellGlyphMapping.begin();
-                const auto end = _r.cellGlyphMapping.end();
+                const auto beg = _r.rows.begin();
+                const auto end = _r.rows.end();
                 std::move_backward(beg, end - offset, end);
             }
         }
@@ -248,40 +232,6 @@ try
     _api.dirtyRect = til::rect{ 0, _api.invalidatedRows.x, _api.cellCount.x, _api.invalidatedRows.y };
     _r.dirtyRect = _api.dirtyRect;
     _r.scrollOffset = _api.scrollOffset;
-
-    // This is an important block of code for our TileHashMap.
-    // We only process glyphs within the dirtyRect, but glyphs outside of the
-    // dirtyRect are still in use and shouldn't be discarded. This is critical
-    // if someone uses a tool like tmux to split the terminal horizontally.
-    // If they then print a lot of Unicode text on just one side, we have to
-    // ensure that the (for example) plain ASCII glyphs on the other half of the
-    // viewport are still retained. This bit of code "refreshes" those glyphs and
-    // brings them to the front of the LRU queue to prevent them from being reused.
-    {
-        const std::array<til::point, 2> ranges{ {
-            { 0, _api.dirtyRect.top },
-            { _api.dirtyRect.bottom, _api.cellCount.y },
-        } };
-        const auto stride = static_cast<size_t>(_r.cellCount.x);
-
-        for (const auto& p : ranges)
-        {
-            // We (ab)use the .x/.y members of the til::point as the
-            // respective [from,to) range of rows we need to makeNewest().
-            const auto from = p.x;
-            const auto to = p.y;
-
-            for (auto y = from; y < to; ++y)
-            {
-                auto it = _r.cellGlyphMapping.data() + stride * y;
-                const auto end = it + stride;
-                for (; it != end; ++it)
-                {
-                    _r.glyphs.makeNewest(*it);
-                }
-            }
-        }
-    }
 
     return S_OK;
 }
@@ -490,7 +440,10 @@ try
         }
 
         const u32x2 newColors{ gsl::narrow_cast<u32>(fg), gsl::narrow_cast<u32>(bg) };
-        const AtlasKeyAttributes attributes{ 0, textAttributes.IsIntense() && renderSettings.GetRenderMode(RenderSettings::Mode::IntenseIsBold), textAttributes.IsItalic(), 0 };
+        const AtlasKeyAttributes attributes{
+            .bold = textAttributes.IsIntense() && renderSettings.GetRenderMode(RenderSettings::Mode::IntenseIsBold),
+            .italic = textAttributes.IsItalic()
+        };
 
         if (_api.attributes != attributes)
         {
@@ -677,7 +630,29 @@ void AtlasEngine::_createResources()
         }
 
         THROW_IF_FAILED(_r.device->CreateVertexShader(&shader_vs[0], sizeof(shader_vs), nullptr, _r.vertexShader.put()));
-        THROW_IF_FAILED(_r.device->CreatePixelShader(&shader_ps[0], sizeof(shader_ps), nullptr, _r.pixelShader.put()));
+        THROW_IF_FAILED(_r.device->CreatePixelShader(&shader_text_ps[0], sizeof(shader_text_ps), nullptr, _r.pixelShader.put()));
+
+        {
+            static constexpr D3D11_INPUT_ELEMENT_DESC layout[]{
+                { "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, D3D11_APPEND_ALIGNED_ELEMENT, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+                { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, D3D11_APPEND_ALIGNED_ELEMENT, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+                { "COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, D3D11_APPEND_ALIGNED_ELEMENT, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+            };
+            THROW_IF_FAILED(_r.device->CreateInputLayout(&layout[0], gsl::narrow_cast<UINT>(std::size(layout)), &shader_vs[0], sizeof(shader_vs), _r.textInputLayout.put()));
+        }
+
+        {
+            D3D11_BLEND_DESC desc{};
+            desc.RenderTarget[0].BlendEnable = true;
+            desc.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
+            desc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+            desc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+            desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+            desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+            desc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+            desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+            THROW_IF_FAILED(_r.device->CreateBlendState(&desc, _r.textBlendState.put()));
+        }
 
         if (!_api.customPixelShaderPath.empty())
         {
@@ -874,7 +849,6 @@ void AtlasEngine::_createSwapChain()
             THROW_IF_FAILED(dxgiFactory.query<IDXGIFactoryMedia>()->CreateSwapChainForCompositionSurfaceHandle(_r.device.get(), _api.swapChainHandle.get(), &desc, nullptr, _r.swapChain.put()));
         }
 
-        if constexpr (!debugGeneralPerformance)
         {
             const auto swapChain2 = _r.swapChain.query<IDXGISwapChain2>();
             _r.frameLatencyWaitableObject.reset(swapChain2->GetFrameLatencyWaitableObject());
@@ -907,7 +881,7 @@ void AtlasEngine::_recreateSizeDependentResources()
     //   Before you call ResizeBuffers, ensure that the application releases all references [...].
     //   You can use ID3D11DeviceContext::ClearState to ensure that all [internal] references are released.
     // The _r.cells check exists simply to prevent us from calling ResizeBuffers() on startup (i.e. when `_r` is empty).
-    if (_r.cells)
+    if (!_r.rows.empty())
     {
         if (_r.d2dMode)
         {
@@ -932,15 +906,9 @@ void AtlasEngine::_recreateSizeDependentResources()
 
         // This buffer is a bit larger than the others (multiple MB).
         // Prevent a memory usage spike, by first deallocating and then allocating.
-        _r.cells = {};
-        _r.cellGlyphMapping = {};
-        // Our render loop heavily relies on memcpy() which is between 1.5x
-        // and 40x faster for allocations with an alignment of 32 or greater.
-        // (40x on AMD Zen1-3, which have a rep movsb performance issue. MSFT:33358259.)
-        _r.cells = Buffer<Cell, 32>{ totalCellCount };
-        _r.cellGlyphMapping = Buffer<TileHashMap::iterator>{ totalCellCount };
         _r.cellCount = _api.cellCount;
-        _r.tileAllocator.setMaxArea(_api.sizeInPixel);
+        _r.rows = {};
+        _r.rows.resize(_r.cellCount.y);
 
         // .clear() doesn't free the memory of these buffers.
         // This code allows them to shrink again.
@@ -956,21 +924,6 @@ void AtlasEngine::_recreateSizeDependentResources()
         _api.glyphProps = Buffer<DWRITE_SHAPING_GLYPH_PROPERTIES>{ projectedGlyphSize };
         _api.glyphAdvances = Buffer<f32>{ projectedGlyphSize };
         _api.glyphOffsets = Buffer<DWRITE_GLYPH_OFFSET>{ projectedGlyphSize };
-
-        // Initialize cellGlyphMapping with valid data (whitespace), so that it can be
-        // safely used by the TileHashMap refresh logic via makeNewest() in StartPaint().
-        {
-            u16x2* coords{};
-            AtlasKey key{ { .cellCount = 1 }, 1, L" " };
-            AtlasValue value{ CellFlags::None, 1, &coords };
-
-            coords[0] = _r.tileAllocator.allocate(_r.glyphs);
-
-            const auto it = _r.glyphs.insert(std::move(key), std::move(value));
-            _r.glyphQueue.emplace_back(it);
-
-            std::fill(_r.cellGlyphMapping.begin(), _r.cellGlyphMapping.end(), it);
-        }
     }
 
     if (!_r.d2dMode)
@@ -997,31 +950,15 @@ void AtlasEngine::_recreateSizeDependentResources()
             THROW_IF_FAILED(_r.device->CreateRenderTargetView(_r.customOffscreenTexture.get(), nullptr, _r.customOffscreenTextureTargetView.addressof()));
         }
 
-        // Tell D3D which parts of the render target will be visible.
-        // Everything outside of the viewport will be black.
-        {
-            D3D11_VIEWPORT viewport{};
-            viewport.Width = static_cast<float>(_api.sizeInPixel.x);
-            viewport.Height = static_cast<float>(_api.sizeInPixel.y);
-            _r.deviceContext->RSSetViewports(1, &viewport);
-        }
-
         if (resize)
         {
-            D3D11_BUFFER_DESC desc;
-            desc.ByteWidth = gsl::narrow<u32>(totalCellCount * sizeof(Cell)); // totalCellCount can theoretically be UINT32_MAX!
+            D3D11_BUFFER_DESC desc{};
+            desc.ByteWidth = gsl::narrow_cast<UINT>(sizeof(VertexData) * totalCellCount);
             desc.Usage = D3D11_USAGE_DYNAMIC;
-            desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
             desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-            desc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
-            desc.StructureByteStride = sizeof(Cell);
-            THROW_IF_FAILED(_r.device->CreateBuffer(&desc, nullptr, _r.cellBuffer.put()));
-            THROW_IF_FAILED(_r.device->CreateShaderResourceView(_r.cellBuffer.get(), nullptr, _r.cellView.put()));
+            THROW_IF_FAILED(_r.device->CreateBuffer(&desc, nullptr, _r.vertexBuffer.put()));
         }
-
-        // We have called _r.deviceContext->ClearState() in the beginning and lost all D3D state.
-        // This forces us to set up everything up from scratch again.
-        _setShaderResources();
     }
 
     WI_ClearFlag(_api.invalidations, ApiInvalidations::Size);
@@ -1050,11 +987,6 @@ void AtlasEngine::_recreateFontDependentResources()
         _r.dipPerPixel = static_cast<float>(USER_DEFAULT_SCREEN_DPI) / static_cast<float>(_r.dpi);
         _r.pixelPerDIP = static_cast<float>(_r.dpi) / static_cast<float>(USER_DEFAULT_SCREEN_DPI);
         _r.atlasSizeInPixel = { 0, 0 };
-        _r.tileAllocator = TileAllocator{ _api.fontMetrics.cellSize, _api.sizeInPixel };
-
-        _r.glyphs = {};
-        _r.glyphQueue = {};
-        _r.glyphQueue.reserve(64);
     }
     // D3D specifically for UpdateDpi()
     // This compensates for the built in scaling factor in a XAML SwapChainPanel (CompositionScaleX/Y).
@@ -1162,43 +1094,12 @@ const AtlasEngine::Buffer<DWRITE_FONT_AXIS_VALUE>& AtlasEngine::_getTextFormatAx
     return _r.textFormatAxes[italic][bold];
 }
 
-AtlasEngine::Cell* AtlasEngine::_getCell(u16 x, u16 y) noexcept
-{
-    assert(x < _r.cellCount.x);
-    assert(y < _r.cellCount.y);
-    return _r.cells.data() + static_cast<size_t>(_r.cellCount.x) * y + x;
-}
-
-AtlasEngine::TileHashMap::iterator* AtlasEngine::_getCellGlyphMapping(u16 x, u16 y) noexcept
-{
-    assert(x < _r.cellCount.x);
-    assert(y < _r.cellCount.y);
-    return _r.cellGlyphMapping.data() + static_cast<size_t>(_r.cellCount.x) * y + x;
-}
-
 void AtlasEngine::_setCellFlags(u16r coords, CellFlags mask, CellFlags bits) noexcept
 {
     assert(coords.left <= coords.right);
     assert(coords.top <= coords.bottom);
     assert(coords.right <= _r.cellCount.x);
     assert(coords.bottom <= _r.cellCount.y);
-
-    const auto filter = ~mask;
-    const auto width = static_cast<size_t>(coords.right) - coords.left;
-    const auto height = static_cast<size_t>(coords.bottom) - coords.top;
-    const auto stride = static_cast<size_t>(_r.cellCount.x);
-    auto row = _r.cells.data() + static_cast<size_t>(_r.cellCount.x) * coords.top + coords.left;
-    const auto end = row + height * stride;
-
-    for (; row != end; row += stride)
-    {
-        const auto dataEnd = row + width;
-        for (auto data = row; data != dataEnd; ++data)
-        {
-            const auto current = data->flags;
-            data->flags = (current & filter) | bits;
-        }
-    }
 }
 
 void AtlasEngine::_flushBufferLine()
@@ -1272,7 +1173,6 @@ void AtlasEngine::_flushBufferLine()
 #pragma warning(suppress : 26494) // Variable 'mappedEnd' is uninitialized. Always initialize an object (type.5).
     for (u32 idx = 0, mappedEnd; idx < _api.bufferLine.size(); idx = mappedEnd)
     {
-        if (_sr.systemFontFallback)
         {
             auto scale = 1.0f;
             u32 mappedLength = 0;
@@ -1323,47 +1223,8 @@ void AtlasEngine::_flushBufferLine()
 
             if (!mappedFontFace)
             {
-                // Task: Replace all characters in this range with unicode replacement characters.
-                // Input (where "n" is a narrow and "ww" is a wide character):
-                //    _api.bufferLine       = "nwwnnw"
-                //    _api.bufferLineColumn = {0, 1, 1, 3, 4, 5, 5, 6}
-                //                             n  w  w  n  n  w  w
-                // Solution:
-                //   Iterate through bufferLineColumn until the value changes, because this indicates we passed over a
-                //   complete (narrow or wide) cell. To do so we'll use col1 (previous column) and col2 (next column).
-                //   Then we emit a replacement character by telling _emplaceGlyph that this range has no font face.
-                auto pos1 = idx;
-                auto col1 = _api.bufferLineColumn[pos1];
-                for (auto pos2 = idx + 1; pos2 <= mappedEnd; ++pos2)
-                {
-                    if (const auto col2 = _api.bufferLineColumn[pos2]; col1 != col2)
-                    {
-                        _emplaceGlyph(nullptr, pos1, pos2);
-                        pos1 = pos2;
-                        col1 = col2;
-                    }
-                }
-
                 continue;
             }
-        }
-        else
-        {
-            if (!mappedFontFace)
-            {
-                const auto baseWeight = _api.attributes.bold ? DWRITE_FONT_WEIGHT_BOLD : static_cast<DWRITE_FONT_WEIGHT>(_api.fontMetrics.fontWeight);
-                const auto baseStyle = _api.attributes.italic ? DWRITE_FONT_STYLE_ITALIC : DWRITE_FONT_STYLE_NORMAL;
-
-                wil::com_ptr<IDWriteFontFamily> fontFamily;
-                THROW_IF_FAILED(fontCollection->GetFontFamily(0, fontFamily.addressof()));
-
-                wil::com_ptr<IDWriteFont> font;
-                THROW_IF_FAILED(fontFamily->GetFirstMatchingFont(baseWeight, DWRITE_FONT_STRETCH_NORMAL, baseStyle, font.addressof()));
-
-                THROW_IF_FAILED(font->CreateFontFace(mappedFontFace.put()));
-            }
-
-            mappedEnd = gsl::narrow_cast<u32>(_api.bufferLine.size());
         }
 
         // We can reuse idx here, as it'll be reset to "idx = mappedEnd" in the outer loop anyways.
@@ -1374,13 +1235,16 @@ void AtlasEngine::_flushBufferLine()
 
             if (isTextSimple)
             {
-                size_t beg = 0;
+                auto& row = _r.rows[_api.lastPaintBufferLineCoord.y];
+
                 for (size_t i = 0; i < complexityLength; ++i)
                 {
-                    if (_emplaceGlyph(mappedFontFace.get(), idx + beg, idx + i + 1))
-                    {
-                        beg = i + 1;
-                    }
+                    GlyphPlacement placement;
+                    placement.key.fontFace = mappedFontFace;
+                    placement.key.glyphs.emplace_back(_api.glyphIndices[i]);
+                    placement.baseline.x = _api.bufferLineColumn[idx + i] * _api.fontMetrics.cellSize.x;
+                    placement.baseline.y = _api.lastPaintBufferLineCoord.y * _api.fontMetrics.cellSize.y + _api.fontMetrics.baseline;
+                    row.emplace_back(std::move(placement));
                 }
             }
             else
@@ -1490,15 +1354,10 @@ void AtlasEngine::_flushBufferLine()
 
                     _api.textProps[a.textLength - 1].canBreakShapingAfter = 1;
 
-                    size_t beg = 0;
                     for (size_t i = 0; i < a.textLength; ++i)
                     {
                         if (_api.textProps[i].canBreakShapingAfter)
                         {
-                            if (_emplaceGlyph(mappedFontFace.get(), a.textPosition + beg, a.textPosition + i + 1))
-                            {
-                                beg = i + 1;
-                            }
                         }
                     }
                 }
@@ -1510,104 +1369,5 @@ void AtlasEngine::_flushBufferLine()
 
 bool AtlasEngine::_emplaceGlyph(IDWriteFontFace* fontFace, size_t bufferPos1, size_t bufferPos2)
 {
-    static constexpr auto replacement = L'\uFFFD';
-
-    // This would seriously blow us up otherwise.
-    Expects(bufferPos1 < bufferPos2 && bufferPos2 <= _api.bufferLine.size());
-
-    // _flushBufferLine() ensures that bufferLineColumn.size() > bufferLine.size().
-    const auto x1 = _api.bufferLineColumn[bufferPos1];
-    const auto x2 = _api.bufferLineColumn[bufferPos2];
-
-    // x1 == x2, if our TextBuffer and DirectWrite disagree where glyph boundaries are. Example:
-    // Our line of text contains a wide glyph consisting of 2 surrogate pairs "xx" and "yy".
-    // If DirectWrite considers the first "xx" to be separate from the second "yy", we'll get:
-    //   _api.bufferLine       = "...xxyy..."
-    //   _api.bufferLineColumn = {01233335678}
-    //                               ^ ^
-    //                              /   \
-    //                      bufferPos1  bufferPos2
-    //   x1: _api.bufferLineColumn[bufferPos1] == 3
-    //   x1: _api.bufferLineColumn[bufferPos2] == 3
-    // --> cellCount (which is x2 - x1) is now 0 (invalid).
-    //
-    // Assuming that the TextBuffer implementation doesn't have any bugs...
-    // I'm not entirely certain why this occurs, but to me, a layperson, it appears as if
-    // IDWriteFontFallback::MapCharacters() doesn't respect extended grapheme clusters.
-    // It could also possibly be due to a difference in the supported Unicode version.
-    if (x1 >= x2 || x2 > _api.cellCount.x)
-    {
-        return false;
-    }
-
-    const auto chars = fontFace ? &_api.bufferLine[bufferPos1] : &replacement;
-    const auto charCount = fontFace ? bufferPos2 - bufferPos1 : 1;
-    const u16 cellCount = x2 - x1;
-
-    auto attributes = _api.attributes;
-    attributes.cellCount = cellCount;
-
-    AtlasKey key{ attributes, gsl::narrow<u16>(charCount), chars };
-    auto it = _r.glyphs.find(key);
-
-    if (it == _r.glyphs.end())
-    {
-        // Do fonts exist *in practice* which contain both colored and uncolored glyphs? I'm pretty sure...
-        // However doing it properly means using either of:
-        // * IDWriteFactory2::TranslateColorGlyphRun
-        // * IDWriteFactory4::TranslateColorGlyphRun
-        // * IDWriteFontFace4::GetGlyphImageData
-        //
-        // For the first two I wonder how one is supposed to restitch the 27 required parameters from a
-        // partial (!) text range returned by GetGlyphs(). Our caller breaks the GetGlyphs() result up
-        // into runs of characters up until the first canBreakShapingAfter == true after all.
-        // There's no documentation for it and I'm sure I'd mess it up.
-        // For very obvious reasons I didn't want to write this code.
-        //
-        // IDWriteFontFace4::GetGlyphImageData seems like the best approach and DirectWrite uses the
-        // same code that GetGlyphImageData uses to implement TranslateColorGlyphRun (well partially).
-        // However, it's a heavy operation and parses the font file on disk on every call (TranslateColorGlyphRun doesn't).
-        // For less obvious reasons I didn't want to write this code either.
-        //
-        // So this is a job for future me/someone.
-        // Bonus points for doing it without impacting performance.
-        auto flags = CellFlags::None;
-        if (fontFace)
-        {
-            const auto fontFace2 = wil::try_com_query<IDWriteFontFace2>(fontFace);
-            WI_SetFlagIf(flags, CellFlags::ColoredGlyph, fontFace2 && fontFace2->IsColorFont());
-        }
-
-        // The AtlasValue constructor fills the `coords` variable with a pointer to an array
-        // of at least `cellCount` elements. I did this so that I don't have to type out
-        // `value.data()->coords` again, despite the constructor having all the data necessary.
-        u16x2* coords;
-        AtlasValue value{ flags, cellCount, &coords };
-
-        for (u16 i = 0; i < cellCount; ++i)
-        {
-            coords[i] = _r.tileAllocator.allocate(_r.glyphs);
-        }
-
-        it = _r.glyphs.insert(std::move(key), std::move(value));
-        _r.glyphQueue.emplace_back(it);
-    }
-
-    const auto valueData = it->second.data();
-    const auto coords = &valueData->coords[0];
-    const auto cells = _getCell(x1, _api.lastPaintBufferLineCoord.y);
-    const auto cellGlyphMappings = _getCellGlyphMapping(x1, _api.lastPaintBufferLineCoord.y);
-
-    for (u32 i = 0; i < cellCount; ++i)
-    {
-        cells[i].tileIndex = coords[i];
-        // We should apply the column color and flags from each column (instead
-        // of copying them from the x1) so that ligatures can appear in multiple
-        // colors with different line styles.
-        cells[i].flags = valueData->flags | _api.bufferLineMetadata[static_cast<size_t>(x1) + i].flags;
-        cells[i].color = _api.bufferLineMetadata[static_cast<size_t>(x1) + i].colors;
-    }
-
-    std::fill_n(cellGlyphMappings, cellCount, it);
     return true;
 }
